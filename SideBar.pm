@@ -732,8 +732,8 @@ testbar.pl in the examples directory shows how it's done.
 =head1 BUGS
 
 Please report through CPAN: 
- E<lt>http://rt.cpan.org/NoAuth/Bugs.html?Dist=Tree-Numbered-DBE<gt>
- or send mail to E<lt>bug-Tree-Numbered-DB#rt.cpan.orgE<gt> 
+ E<lt>http://rt.cpan.org/NoAuth/Bugs.html?Dist=HTML-Widget-SideBarE<gt>
+ or send mail to E<lt>bug-HTML-Widget-SideBar#rt.cpan.orgE<gt> 
 
 =head1 SEE ALSO
 
