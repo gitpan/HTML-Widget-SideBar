@@ -3,11 +3,12 @@ package HTML::Widget::SideBar;
 use strict; # Or get downvoted at Perl Monks :)
 
 use CGI;
+use Tree::Numbered;
 use base 'Tree::Numbered';
 use constant DEFAULT_STYLES => {bar => 'sidebar', list => 'list', 
 				item => 'item'};
 
-our $VERSION = '1.00';
+our $VERSION = '1.02';
 
 # package stuff:
 my $cgi = CGI->new;    # Just for HTML shortcuts.
@@ -43,6 +44,8 @@ my $toggle_action = sub {
 #              a method ($self->generator) so you have access to the
 #              object data when you construct the action (optional).
 #     URL - a url to navigate to on click (optional).
+#     render_hidden - Should submenus be rendered at all? If true,
+#                     The submenus will be rendered and set to hidden via CSS.
 # Returns: The tree object.
 
 sub new {
@@ -58,6 +61,11 @@ sub new {
     # no active propagation:
     $nargs{Active} = (exists $args{active}) ? $args{active} : 0;
 
+    $nargs{RenderHidden} = 
+        (exists $args{render_hidden}) ?
+                $args{render_hidden} :
+                1;
+
     my $properties = $parent->SUPER::new(%nargs);
 
     my $action = $args{action};
@@ -69,9 +77,13 @@ sub new {
 	$properties->{_Parent} = 0;
     }
 
-    $properties->addField('Action'); # Does nothing if exists.
-    $properties->setAction((defined $action) ? $action : $default_action);
-    return $properties;
+	# Add basic set of fields:
+	$properties->addField(Changed => 'yes');
+	$properties->addField('Action'); # Does nothing if exists.
+	$properties->addField(HTML => undef);
+	$properties->addField(Script => undef);
+	
+    	return $properties;
 }
 
 # <convert> takes a Tree::Numbered and makes it a HTML::Widget::SideBar.
@@ -96,9 +108,13 @@ sub convert {
     $active_num ||= 0;
 
     # Won't change existing setting of 'Action' and 'URL' if it's there.
+    $tree->addField(Changed => 'yes');
+    $tree->addField(HTML => undef);
+    $tree->addField(Script => undef);
     $tree->addField('Action', $def_action);
     $tree->addField('URL', $args{base_URL}) if (exists $args{'base_URL'});
     $tree->addField('Active');
+    $tree->addField('RenderHidden', 1);
     $tree->setField('Active', 1) if ($active_num == $tree->getNumber);
     $tree->{_Parent} = $parent_num;
 
@@ -138,7 +154,7 @@ sub readDB {
     # Default creation of Value is no longer used because we request a field.
     $cols->{Value_col} ||= 'name';
 
-    use Tree::Numbered::DB 1.01; 
+    require Tree::Numbered::DB 1.01; 
     my @args = ($table, $dbh, $cols);
     #read -> revert -> convert: construct a DB tree, loose DBness, make sidebar
     my $tree = Tree::Numbered::DB->read(@args);
@@ -149,17 +165,18 @@ sub readDB {
 }
 
 
-# <getHTML> returns the HTML that shows the sidebar.
+# <_generate> creates the HTML that shows the sidebar.
 # Arguments: By name:
 #     styles - alternative set of styles. Default will be used if this isn't
 #              supplied or malformed.
 #     caption - a starting caption. Optional.
 #     expand - if true, all branches will be displayed.
 #     no_ie - if false you'll get some extra code to make IE6 comply.
-# Returns: In list context returns a list of HTML lines to print. In scalar
-#     context returns a reference to same list.
+# Returns: nothing, works on the object; called from either <getHTML> or <getScript>.
 
-sub getHTML {
+
+
+sub _generate {
     my $self = shift;
     my %args = @_;
 
@@ -179,12 +196,24 @@ sub getHTML {
     my @html; # return value.
 
     push @html, $cgi->start_div({-id => $styles->{bar}}), $caption;
+    my $js_buffer = "";
     # Here comes the smart recursive stuff:
-    $self->buildList(0,$args{expand}, $args{no_ie}, $unique, \@html, %$styles);
+    $self->buildList(
+        level => 0,
+        expand => $args{expand}, 
+        no_ie => $args{no_ie}, 
+        unique => $unique, 
+        html => \@html, 
+        styles => \%$styles,
+        js_code => \$js_buffer,
+        );
     push @html, $cgi->end_div;
 
-    return @html if (wantarray);
-    return \@html;
+    # return @html if (wantarray);
+    # return (\@html, $js_buffer);
+	$self->setHTML(\@html);
+	$self->setScript($js_buffer);
+	$self->allProcess( sub { $_[0]->setChanged(0) } );
 }
 
 # <buildList> Helper for <getHTML> (actually does the real work).
@@ -201,7 +230,15 @@ sub getHTML {
 sub buildList {
     my $self = shift;
     my $serial = $self->{_Serial};
-    my ($level, $expand, $no_ie, $unique, $html, %styles) = @_;
+    my %args = (@_);
+    my $level = $args{level};
+    my $expand = $args{expand};
+    my $no_ie = $args{no_ie};
+    my $unique = $args{unique};
+    my $html = $args{html};
+    my %styles = %{$args{styles}};
+    my $js_code = $args{js_code};
+    # my ($level, $expand, $no_ie, $unique, $html, %styles) = @_;
     
     my $next_level = $level + 1; # why recalculate this again and again?
 
@@ -211,49 +248,60 @@ sub buildList {
 					    ($expand ||$self->isActiveBranch));
     push @$html, $start_tag;
     # Code for active sidebar. see POD.
-    push @$html, $cgi->script("openLists.push(getCrossBrowser('sub_$selfId'))")
+    $$js_code .= "openLists.push(getCrossBrowser('sub_$selfId'));\n"
 	if (!$expand && $self->isActiveBranch && $level);
 
     $self->savePlace;
     $self->reset;
 
     while (my $item = $self->nextNode) {
-	my $onClick = $item->getAction()->($item, $level, $unique);
+		my $onClick = $item->getAction()->($item, $level, $unique);
+		my $caption = $item->getFullCap('no_ie');
 
-	my $caption = $item->getFullCap('no_ie');
+		# start finding the list-item's HTML attributes:
+		my $attr = {};
+		if ($onClick) {
+		    $onClick =~ s/([^;])\s*$/$1;/;
+	    	$attr->{-onClick} = $onClick;
+		}
 
-	# start finding the list-item's HTML attributes:
-	my $attr = {};
-	if ($onClick) {
-	    $onClick =~ s/([^;])\s*$/$1;/;
-	    $attr->{-onClick} = $onClick;
-	}
+		my $style = $styles{item};
+		if ($styles{"level$level"}) {
+	    	$style = $styles{"level$level"};
+		}
+		
+		# Active items get their own class, always.
+		$style .= 'Active' if ($item->getActive);
+		my $styleOver = $styles{"${style}Over"} || 
+	    	$styles{"level${level}Over"} || $styles{itemOver};
+		if ($styleOver) {
+	    	# Dynamically change class on mouseover. On Mozilla you can just
+	    	# Create a :hover CSS pseudo-class.
+	    	$attr->{-onMouseOver} = "this.className='$styleOver'";
+	    	$attr->{-onMouseOut} = "this.className='$style'";
+		}
+		$attr->{-class} = $style;
 
-	my $style = $styles{item};
-	if ($styles{"level$level"}) {
-	    $style = $styles{"level$level"};
-	}
-	# Active items get their own class, always.
-	$style .= 'Active' if ($item->getActive);
-	my $styleOver = $styles{"${style}Over"} || 
-	    $styles{"level${level}Over"} || $styles{itemOver};
-	if ($styleOver) {
-	    # Dynamically change class on mouseover. On Mozilla you can just
-	    # Create a :hover CSS pseudo-class.
-	    $attr->{-onMouseOver} = "this.className='$styleOver'";
-	    $attr->{-onMouseOut} = "this.className='$style'";
-	}
-	$attr->{-class} = $style;
-
-	push @$html, ($no_ie) ? $cgi->li($attr, $caption) : 
-	    $cgi->li($cgi->span($attr, $caption));
-
-	# recursive stuff again:
-	if ($item->childCount) {
-	    $item->buildList($next_level, $expand, $no_ie, 
-			     $unique, $html, %styles);
-	}
+		push @$html, ($no_ie) ? $cgi->start_li($attr) : $cgi->start_li();                
+	    
+    	push @$html, ($no_ie) ? $caption : $cgi->span($attr, $caption);
+		
+		# recursive stuff again: Renders sub-lists if needed.
+		if ($item->childCount() && ($item->getRenderHidden() || $expand || $item->isActiveBranch()) ) {
+		    push @$html, $cgi->br();
+	    	$item->buildList(
+            	    level => $next_level, 
+                	expand => $expand, 
+                	no_ie => $no_ie, 
+                	unique => $unique,
+                	html => $html,
+                	styles => \%styles,
+                	js_code => $js_code,
+            );
+		}
+    	push @$html, $cgi->end_li();
     }
+	
     $self->restorePlace;
     push @$html, $end_tag;
 }
@@ -294,6 +342,64 @@ sub genListCode {
 sub getUniqueId {
     my $self = shift;
     return "$self->{_LuckyNumber}__$self->{_Serial}";
+}
+
+# <setField> adds the handling of the 'changed' flag to the inherited sub.
+# Arguments and return value are the same as the inherited sub.
+
+sub setField {
+	my $self = shift;
+	my $field = shift;
+
+	my $rv = $self->SUPER::setField($field, @_);
+	if ($rv && $field ne 'Changed') { 
+		$self->setChanged('yes') ; 
+	}
+
+	return $rv;
+}
+
+# <getHTML> will return the HTML code for the sidebar, generating it if necessary.
+# Arguments: same as for <_generate>.
+#In list context returns a list of HTML lines to print. In scalar
+#     context returns a reference to same list.
+
+sub getHTML {
+	my $self = shift;
+
+	# Do we need to regenerate?
+	my $regen = $self->getChanged;
+	unless ($regen) {
+		$self->deepProcess (sub { $$_[1] = 1 if $_[0]->getChanged }, \$regen);
+		# Yeah, this isn't very efficient, we need a recursive sub that can 
+		# stop at a condition. I'll modify Tree::Numbered to do that after the
+		# exam in differential equations, maybe :)
+	}
+
+	$self->_generate(@_) if $regen;
+	my $html = $self->getField('HTML');
+	
+	# Backwards compatibility issues prompted this:
+	return @$html if wantarray;
+	return $html;
+}
+	
+# <getScript> will return the JavaScript code for the sidebar, generating it if necessary.
+# Arguments: same as for <_generate>.
+# In list context returns a list of HTML lines to print. In scalar
+#     context returns a reference to same list.
+
+sub getScript {
+	my $self = shift;
+
+	# Do we need to regenerate?
+	my $regen = $self->getChanged;
+	unless ($regen) {
+		$self->deepProcess (sub { $$_[0] = 1 if $_[0]->getChanged }, \$regen);
+	}
+
+	$self->_generate(@_) if $regen;
+	return $self->getField('Script');
 }
 
 # <setAction> sets the action on an item. if no action is given, the default 
@@ -558,7 +664,7 @@ To make an item do nothing at all, use $item->I<setAction> with no parameters.
 
 An important feature is that actions are inherited by new nodes from their parents. This allows you to set the beaveiour when you create the root element and not worry about it later on.
 
-B<I18n alert!> What this all means is that you supply some of the strings the module will be working with. This means you could, by mistake, send strings that are mixed utf8 (perl's internal encoding) and your encoding. This might break things, so if something breaks, see that your strings are in one encoding. A bitch, eh? That's the way it is when you're not in the USA or Britain.
+B<I18n alert!> What this all means is that you supply some of the strings the module will be working with. This means you could, by mistake, send strings that are mixed utf8 (perl's internal encoding) and your encoding. This might break things, so if something breaks, see that your strings are in one encoding. A bitch, eh? That's the way it is when you're not in an English-speaking country.
 
 =head2 But I don't need all this stuff! I just want a navigational menu!
 
@@ -588,9 +694,13 @@ If you have the module Tree::Numbered::DB (another one of mine) and you use it t
 
 =back
 
-=head2 Printing the HTML
+=head2 Printing the code
 
 Now all you have to do is $tree->getHTML. this will return an array so you can shift out the caption and locate it inside some div while the rest of the menu is located outside, avoiding width constraints. You can also push other stuff inside and create a widget for your script.
+
+At any time you can also call $tree->getScript which will get you any Javascript code that was generated for the script. You won't get that code in the HTML array, which is new in version 1.02.
+
+Calling any of the above methods after changing the tree (setting a field or adding a node but still not deleting one) will regenerate both the HTML and the script! Pay attention to their concurrency.
 
 =head1 METHODS
 
@@ -602,11 +712,13 @@ There are three of them:
 
 =over 4
 
-=item new (I<value> => $value, action => $action, URL => $url)
+=item new (I<value> => $value, action => $action, URL => $url, render_hidden => $yes_or_not)
 
 Creates a new tree with one root element, whose text is specified by the value argument. If an action is not supplied, the package's default do-nothig action will be used. You'll have to add nodes manually via the I<append> method.
 
 If a URL is supplied, the node will be an anchor reffering to that URL.
+
+If render_hidden is false, no sub-menus will appear unless the active item is inside a sub menu, in which case said sub-menu will appear.
 
 =item convert (I<tree> => $tree, action => $action, base_URL => $url)
 
@@ -624,17 +736,17 @@ The cols argument allows you to supply field mappings for the tree (see Tree::Nu
 
 =back
 
-=head2 append (value => I<$value>, action => $action, URL => $url)
+=head2 append (value => I<$value>, action => $action, URL => $url, render_hidden => $yes_or_not)
 
 Adds a new child with the value (caption) $value. An action or a URL are optional, as described in I<new>. If one of those is not given, the value is taken from its parent (if its parent has one).
 
 =head2 getHTML (styles => $styles, caption => 'altCaption', no_ie => true, expand => false)
 
-This method returns the HTML for a sidebar whose caption is the node the method was invoked on. The sidebar's caption will be the root element's value unless the caption argument is given.
+This method returns the HTML for a sidebar whose caption is the node the method was invoked on. The sidebar's caption will be the root element's value unless the caption argument is given. All arguments are optional if the tree was not changet since the last call to either I<getHTML> or I<getScript>.
 
 The expand argument, if true, will cause all nodes to be shown. Otherwise only the active branch us shown.
 
-Unless you specify no_ie as true, the sidebar's caption will be wrapped up in a link so you cn use the :hover CSSpseudo-class on it.
+Unless you specify no_ie as true, the sidebar's caption will be wrapped up in a link so you cn use the :hover CSS pseudo-class on it.
 
 the optional styles argument allows you to change default style names described above. This should be a hash reference, with a key for each style, specifying the new name. Like:
 
@@ -643,6 +755,12 @@ the optional styles argument allows you to change default style names described 
             level0Over => 'navover'}
 
 You can give values to 'bar' (sidebar name), 'list' (list style) and 'item' (list item class). You can also give a certain level N its own class by giving a pair: levelB<N> => 'someclass'. A hover style for this property can be given either with 'levelB<N>Over', or the level's class appended with 'Over'. The first level is level 0. if a style called 'itemOver' is given, it will apply to all items regardless of their class, unless they already have some other mouseover setting.
+
+In aray context will return the array as said, in scalar context will return a ref to that array.
+
+=head2 getScript (styles => $styles, caption => 'altCaption', no_ie => true, expand => false)
+
+Returns the script generated for the sidebar. All arguments are ignored if the tree was not changed since the last call to either I<getHTML> or I<getScript>. If the arguments are used, they mean the same as described under I<getHTML>
 
 =head2 Accessors
 
@@ -716,32 +834,35 @@ deepBlueCSS, buildCSS, baseJS, getHTML
 
 =item Fields:
 
-*addField, *removeField, *setField, *setFields, *getField, *getFields, *hasField.
+*addField, *removeField, setField, *setFields, *getField, *getFields, *hasField.
 
 =back
 
 
 =head1 BROWSER COMPATIBILITY
 
-Tested on IE6 and Mozilla 1.4 and worked. On Konqueror it's OK too but not thoroughly tested. If you test it on other browsers, please let me know what is the result.
+Tested on IE6 and Firefox 1.0PR and worked. On Konqueror it's OK too but not thoroughly tested. If you test it on other browsers, please let me know what is the result.
 
 =head1 EXAMPLES
 
 testbar.pl in the examples directory shows how it's done.
+perl-begin.css in the same place is a full style sheet taken from a site that uses this module.
 
 =head1 BUGS
 
-Please report through CPAN: 
- E<lt>http://rt.cpan.org/NoAuth/Bugs.html?Dist=HTML-Widget-SideBarE<gt>
- or send mail to E<lt>bug-HTML-Widget-SideBar#rt.cpan.orgE<gt> 
+Directly to the author, please.
 
 =head1 SEE ALSO
 
-Tree::Numbered, Tree::Numbered::DB, Javascript::Menu
+Tree::Numbered, Tree::Numbered::Tools, Tree::Numbered::DB, Javascript::Menu
 
 =head1 AUTHOR
 
 Yosef Meller, E<lt>mellerf@netvision.net.ilE<gt>
+
+=head1 CREDITS
+
+Shlomi Fish added the render_hidden attribute, and some of the code that separates the script from the HTML. Also supplied the CSS for examples/perl-begin.css
 
 =head1 COPYRIGHT AND LICENSE
 
@@ -749,5 +870,7 @@ Copyright 2004 by Yosef Meller
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself. 
+
+Exception: the file examples/perl-begin.css is not by me and uses a different license. See the head of that file for details.
 
 =cut
