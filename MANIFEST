@@ -1,0 +1,9 @@
+Changes
+Makefile.PL
+MANIFEST
+SideBar.pm
+README
+t/1.t
+t/2.t
+t/3.t
+examples/testbar.pl
